@@ -248,9 +248,10 @@ function deriveStatusLabelFromRow(row) {
   if (dataRoomLastAccessed && !/not yet accessed|not\s*yet/.test(dataRoomLastAccessed)) return "Data Room Accessed / NDA Executed";
   if (/granted|yes|y/.test(dataRoomGranted)) return "Invited to Data Room";
 
-  // Fallback to prospect-level hints
+  // Fallback to prospect-level hints (ignore soft-circled as authoritative)
   const prospectStatus = lower(get("Prospect Status"));
   const latestUpdate = lower(get("Latest update"));
+  if (prospectStatus.includes('soft') && prospectStatus.includes('circled')) return "";
   if (/ppm|pitch\s*deck|deck\s*sent/.test(latestUpdate)) return "Deck & PPM Sent";
   if (/first\s*meeting|meeting\s+scheduled|intro\s*call|intro\b/.test(latestUpdate) || /intro|first\s*meeting/.test(prospectStatus)) return "Intro/First Meeting";
   if (/contacted|engaged|early\s*dialogue/.test(prospectStatus)) return "Early Dialogue (Post-Intro)";
