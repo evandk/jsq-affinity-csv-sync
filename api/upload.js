@@ -13,7 +13,7 @@ const V2 = axios.create({
   timeout: 60000,
 });
 
-// Ordered statuses to support thresholding (earliest → latest)
+// Ordered statuses to support thresholding and non-downgrade (earliest → latest)
 const STATUS_ORDER = [
   "Target Identified",
   "Intro/First Meeting",
@@ -28,6 +28,7 @@ const STATUS_ORDER = [
   "Sub Docs Signed",
   "Committed"
 ];
+const STATUS_INDEX = new Map(STATUS_ORDER.map((s, i) => [s.toLowerCase(), i]));
 const MIN_STATUS_LABEL = process.env.MIN_STATUS_LABEL || "Invited to Data Room";
 const MAX_CSV_BYTES = Number(process.env.MAX_CSV_BYTES || 2_000_000); // ~2MB default
 const REQUIRE_API_KEY = process.env.CSV_SYNC_API_KEY ? true : false;
@@ -77,15 +78,22 @@ function isAuthorized(req) {
   return false;
 }
 
-async function fetchAllEntries() {
+async function fetchEntriesWithStatus(statusFieldId) {
   const entries = [];
-  let nextUrl = `/lists/${LIST_ID}/list-entries`;
+  const currentStatusById = new Map();
+  let nextUrl = `/lists/${LIST_ID}/list-entries?fieldIds[]=${encodeURIComponent(statusFieldId)}`;
   while (nextUrl) {
     const { data } = await V2.get(nextUrl);
-    entries.push(...(data?.data || []));
+    const batch = data?.data || [];
+    for (const e of batch) {
+      entries.push(e);
+      const f = (e.fields || []).find(x => String(x.id) === String(statusFieldId));
+      const label = f?.value?.data?.text ? String(f.value.data.text) : "";
+      if (label) currentStatusById.set(e.id, label);
+    }
     nextUrl = data?.pagination?.nextUrl || null;
   }
-  return entries;
+  return { entries, currentStatusById };
 }
 
 async function buildLabelMapFromEntries(statusFieldId) {
@@ -176,70 +184,27 @@ function deriveStatusLabelFromRow(row) {
     return "";
   };
 
-  const prospectStatus = lower(get("Prospect Status"));
-  const subscriptionStatus = lower(get("Subscription Status"));
-  const latestUpdate = lower(get("Latest update"));
+  // Prefer subscription and data room signals
+  const sub = lower(get("Subscription Status")) || lower(get("Subscription")) || anyVal(/subscription\s*status/i).toLowerCase();
   const dataRoomGranted = lower(get("Data room granted"));
   const dataRoomLastAccessed = lower(get("Data room last accessed")) || lower(get("Data room access detail")) || lower(get(" Data room access detail")) || lower(anyVal(/data\s*room.*access/i));
-  const dataRoomGrantDetail = lower(get("Data room grant detail")) || lower(get(" Data room grant detail"));
 
-  // Pre‑NDA onboarded: treat as "New" so we skip updating (below threshold)
-  const isPreNDA = !dataRoomGrantDetail && !/granted|yes|y/.test(dataRoomGranted) && !dataRoomLastAccessed;
-  const isEarlyProspect = prospectStatus === 'new' || prospectStatus.includes('target') || prospectStatus.includes('intro') || prospectStatus.includes('contacted');
-  const noSubdocProgress = !subscriptionStatus || /not started|pending|draft/.test(subscriptionStatus);
-  if (isPreNDA && isEarlyProspect && noSubdocProgress) {
-    return "New";
-  }
+  // High-priority from subscription
+  if (/counter\s*-?signed|fully\s*executed|executed|signed/.test(sub)) return "Sub Docs Signed";
+  if (/awaiting.*investor.*signature|staff review|started|draft/.test(sub)) return "Ready for Sub Docs";
+  if (/invited/.test(sub)) return "Sub Docs Sent";
 
-  // 1) Sub docs signed/sent from subscription status
-  if (/counter\s*-?signed|fully\s*executed|executed|signed/.test(subscriptionStatus)) {
-    return "Sub Docs Signed";
-  }
-  if (/ready/.test(subscriptionStatus) && /sub/.test(subscriptionStatus)) {
-    return "Ready for Sub Docs";
-  }
-  if (/sent|issued|delivered/.test(subscriptionStatus)) {
-    return "Sub Docs Sent";
-  }
+  // Data room signals
+  if (dataRoomLastAccessed && !/not yet accessed|not\s*yet/.test(dataRoomLastAccessed)) return "Data Room Accessed / NDA Executed";
+  if (/granted|yes|y/.test(dataRoomGranted)) return "Invited to Data Room";
 
-  // 2) Committed
-  if (prospectStatus === "committed" || /committed/.test(subscriptionStatus)) {
-    return "Committed";
-  }
-
-  // 3) Ready / Verbal
-  if (/ready/.test(prospectStatus) && /sub/.test(prospectStatus)) {
-    return "Ready for Sub Docs";
-  }
-  if (/verbal/.test(prospectStatus) || /verbal\s*commit/.test(latestUpdate)) {
-    return "Verbal Commit";
-  }
-
-  // 4) Data room
-  if (dataRoomLastAccessed && !/not yet accessed|not\s*yet/.test(dataRoomLastAccessed)) {
-    return "Data Room Accessed / NDA Executed";
-  }
-  if (dataRoomGrantDetail || /invitation.*data\s*room/.test(latestUpdate) || /granted|yes|y/.test(dataRoomGranted)) {
-    return "Invited to Data Room";
-  }
-
-  // 5) Deck & PPM sent
-  if (/ppm|pitch\s*deck|deck\s*sent/.test(latestUpdate)) {
-    return "Deck & PPM Sent";
-  }
-
-  // 6) Meeting stages
-  if (/first\s*meeting|meeting\s+scheduled|intro\s*call|intro\b/.test(latestUpdate) || /intro|first\s*meeting/.test(prospectStatus)) {
-    return "Intro/First Meeting";
-  }
-  if (/contacted|engaged|early\s*dialogue/.test(prospectStatus)) {
-    return "Early Dialogue (Post-Intro)";
-  }
-
-  // 7) Target identified / new
-  if (/target\s*identified/.test(prospectStatus) || prospectStatus === "new") {
-    return "Target Identified";
-  }
+  // Fallback to prospect-level hints
+  const prospectStatus = lower(get("Prospect Status"));
+  const latestUpdate = lower(get("Latest update"));
+  if (/ppm|pitch\s*deck|deck\s*sent/.test(latestUpdate)) return "Deck & PPM Sent";
+  if (/first\s*meeting|meeting\s+scheduled|intro\s*call|intro\b/.test(latestUpdate) || /intro|first\s*meeting/.test(prospectStatus)) return "Intro/First Meeting";
+  if (/contacted|engaged|early\s*dialogue/.test(prospectStatus)) return "Early Dialogue (Post-Intro)";
+  if (/target\s*identified/.test(prospectStatus) || prospectStatus === "new") return "Target Identified";
 
   return "";
 }
@@ -359,8 +324,8 @@ export default async function handler(req, res) {
     // Discover Status field + options from Affinity
     const { statusFieldId, labelToId, field: statusField } = await fetchStatusFieldAndOptions();
 
-    // Load Affinity entries and build a normalized name index
-    const entries = await fetchAllEntries();
+    // Load Affinity entries and current status
+    const { entries, currentStatusById } = await fetchEntriesWithStatus(statusFieldId);
     const nameToEntry = new Map();
     for (const e of entries) {
       const nm = normalizeName(e?.entity?.name || (e?.entity?.first_name && `${e.entity.first_name} ${e.entity.last_name}`) || "");
@@ -368,7 +333,7 @@ export default async function handler(req, res) {
     }
 
     const knownOptions = Array.from(new Set(Array.from(labelToId.keys())));
-    const minIdx = STATUS_ORDER.findIndex(s => s.toLowerCase() === String(MIN_STATUS_LABEL).toLowerCase());
+    const minIdx = STATUS_INDEX.get(String(MIN_STATUS_LABEL).toLowerCase()) ?? -1;
 
     const results = [];
     for (const rec of wantsRaw) {
@@ -388,21 +353,36 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // Enforce minimum status threshold (default: at or after NDA stage)
-      const idx = STATUS_ORDER.findIndex(s => s.toLowerCase() === String(statusLabel || "").toLowerCase());
-      if (idx === -1 || (minIdx !== -1 && idx < minIdx)) {
+      // Enforce minimum threshold and non-downgrade
+      const currentLabel = String(currentStatusById.get(entry.id) || "");
+      if (currentLabel.toLowerCase() === 'passed') {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: 'Currently Passed; no change' });
+        continue;
+      }
+
+      const currentIdx = STATUS_INDEX.get(currentLabel.toLowerCase());
+      const derivedIdx = STATUS_INDEX.get(String(statusLabel || '').toLowerCase());
+
+      if ((minIdx !== -1 && (derivedIdx ?? -1) < minIdx)) {
         results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Status before minimum threshold (${MIN_STATUS_LABEL})` });
+        continue;
+      }
+      if ((currentIdx ?? -1) !== -1 && (derivedIdx ?? -1) !== -1 && derivedIdx < currentIdx) {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Would downgrade from '${currentLabel}' to '${statusLabel}'` });
+        continue;
+      }
+      if (currentLabel && currentLabel.toLowerCase() === String(statusLabel || '').toLowerCase()) {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: 'Unchanged' });
         continue;
       }
 
       const optionId = resolveStatusOptionId(statusLabel, labelToId);
-
       if (!statusLabel) {
         results.push({ name: rec.name, matched: true, entryId: entry.id, updated: false, reason: "Could not derive status from CSV row" });
         continue;
       }
       if (!optionId) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for Affinity field '${statusField.name}'`, knownOptions });
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for field '${statusField.name}'`, knownOptions });
         continue;
       }
 
