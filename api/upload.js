@@ -29,6 +29,9 @@ const STATUS_ORDER = [
   "Committed"
 ];
 const MIN_STATUS_LABEL = process.env.MIN_STATUS_LABEL || "Data Room Accessed / NDA Executed";
+const MAX_CSV_BYTES = Number(process.env.MAX_CSV_BYTES || 2_000_000); // ~2MB default
+const REQUIRE_API_KEY = process.env.CSV_SYNC_API_KEY ? true : false;
+const REDACT_RESPONSE = process.env.REDACT_RESPONSE === '1';
 
 function normalizeName(name) {
   return String(name || "")
@@ -37,6 +40,28 @@ function normalizeName(name) {
     .replace(/\s+lp\b|\s+llc\b|\s+ltd\b|\s+inc\b|\s+co\b|\s+corp\b|\s+partners?\b|\s+capital\b|\s+ventures?\b|\s+management\b|\s+holdings?\b/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isAuthorized(req) {
+  if (!REQUIRE_API_KEY) return true;
+  const apiKey = process.env.CSV_SYNC_API_KEY;
+  const hdrKey = req.headers['x-api-key'] || req.headers['X-API-Key'] || req.headers['x-api_key'];
+  if (hdrKey && String(hdrKey) === apiKey) return true;
+  const auth = String(req.headers['authorization'] || '');
+  if (auth.startsWith('Basic ')) {
+    try {
+      const b64 = auth.slice(6);
+      const [u, p] = Buffer.from(b64, 'base64').toString('utf8').split(':');
+      const userOk = process.env.BASIC_AUTH_USER ? u === process.env.BASIC_AUTH_USER : true;
+      const passOk = process.env.BASIC_AUTH_PASS ? p === process.env.BASIC_AUTH_PASS : true;
+      return userOk && passOk;
+    } catch { /* ignore */ }
+  }
+  if (auth.startsWith('Bearer ')) {
+    const token = auth.slice(7).trim();
+    if (token && token === apiKey) return true;
+  }
+  return false;
 }
 
 async function fetchAllEntries() {
@@ -143,10 +168,25 @@ function deriveStatusLabelFromRow(row) {
   return "";
 }
 
+function redact(results) {
+  if (!REDACT_RESPONSE) return results;
+  return results.map(r => ({
+    matched: r.matched,
+    updated: r.updated,
+    wouldUpdate: r.wouldUpdate,
+    reason: r.reason
+  }));
+}
+
 export default async function handler(req, res) {
   try {
+    // Security headers
+    res.setHeader('Cache-Control', 'no-store');
+
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Use POST" });
     if (!process.env.AFFINITY_V2_TOKEN) return res.status(500).json({ ok: false, error: "Missing AFFINITY_V2_TOKEN" });
+
+    if (!isAuthorized(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
     const isDryRun = (() => {
       try {
@@ -164,7 +204,8 @@ export default async function handler(req, res) {
         // raw stream fallback
         csvText = await new Promise((resolve, reject) => {
           let data = "";
-          req.on("data", chunk => data += chunk);
+          let total = 0;
+          req.on("data", chunk => { total += chunk.length; if (total > MAX_CSV_BYTES) { req.destroy(); } else { data += chunk; } });
           req.on("end", () => resolve(data));
           req.on("error", reject);
         });
@@ -177,6 +218,7 @@ export default async function handler(req, res) {
     }
 
     if (!csvText) return res.status(400).json({ ok: false, error: "No CSV provided" });
+    if (Buffer.byteLength(csvText, 'utf8') > MAX_CSV_BYTES) return res.status(413).json({ ok: false, error: "CSV too large" });
 
     // Parse CSV
     const records = parse(csvText, {
@@ -264,7 +306,7 @@ export default async function handler(req, res) {
       }
     }
 
-    return res.status(200).json({ ok: true, total: wantsRaw.length, results });
+    return res.status(200).json({ ok: true, total: wantsRaw.length, results: redact(results) });
   } catch (e) {
     const status = e?.response?.status || 500;
     const data = e?.response?.data || e.message;
