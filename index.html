@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JSQ → Affinity CSV Sync</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; }
+      .box { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; max-width: 720px; }
+      .row { margin: 0.5rem 0; }
+      input[type=file] { display: block; margin: 0.5rem 0; }
+      pre { background: #fafafa; padding: 1rem; border: 1px solid #eee; border-radius: 6px; overflow: auto; }
+      button { padding: 0.5rem 1rem; border: 1px solid #555; border-radius: 6px; background: #111; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+  </head>
+  <body>
+    <h1>Juniper Square → Affinity CSV Sync</h1>
+    <div class="box">
+      <div class="row">Upload the latest CSV export from Juniper Square. We'll match by name (exact, then fuzzy) and update the Status dropdown in Affinity.</div>
+      <div class="row"><strong>Note:</strong> You must configure STATUS_LABEL_TO_OPTION_ID on the server to map CSV labels to Affinity dropdown option IDs.</div>
+      <div class="row">
+        <input id="file" type="file" accept=".csv,text/csv" />
+        <button id="send">Upload & Sync</button>
+      </div>
+      <div class="row">
+        <pre id="out">Waiting for upload…</pre>
+      </div>
+    </div>
+    <script>
+      const fileEl = document.getElementById('file');
+      const sendBtn = document.getElementById('send');
+      const out = document.getElementById('out');
+
+      async function uploadCsv() {
+        const f = fileEl.files[0];
+        if (!f) { out.textContent = 'Please choose a CSV file.'; return; }
+        sendBtn.disabled = true;
+        out.textContent = 'Uploading…';
+        try {
+          const text = await f.text();
+          const resp = await fetch('/api/upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/csv' },
+            body: text
+          });
+          const data = await resp.json();
+          out.textContent = JSON.stringify(data, null, 2);
+        } catch (e) {
+          out.textContent = 'Error: ' + (e?.message || e);
+        } finally {
+          sendBtn.disabled = false;
+        }
+      }
+
+      sendBtn.addEventListener('click', uploadCsv);
+    </script>
+  </body>
+  </html>
+
+

@@ -3,11 +3,6 @@ import { parse } from "csv-parse/sync";
 import stringSimilarity from "string-similarity";
 
 const LIST_ID = 300305; // Affinity list id
-const FIELD_STATUS = "field-REPLACE_STATUS_ID"; // Dropdown field id in Affinity for Status
-const STATUS_LABEL_TO_OPTION_ID = {
-  // Example mapping: set real option ids from /v2/lists/{id}/fields
-  "Sub docs signed": "dropdown-option-REPLACE_OPTION_ID",
-};
 
 const V2 = axios.create({
   baseURL: "https://api.affinity.co/v2",
@@ -17,6 +12,23 @@ const V2 = axios.create({
   },
   timeout: 60000,
 });
+
+// Ordered statuses to support thresholding (earliest → latest)
+const STATUS_ORDER = [
+  "Target Identified",
+  "Intro/First Meeting",
+  "Early Dialogue (Post-Intro)",
+  "Deck & PPM Sent",
+  "Circle Back after First Close",
+  "Invited to Data Room",
+  "Data Room Accessed / NDA Executed",
+  "Verbal Commit",
+  "Ready for Sub Docs",
+  "Sub Docs Sent",
+  "Sub Docs Signed",
+  "Committed"
+];
+const MIN_STATUS_LABEL = process.env.MIN_STATUS_LABEL || "Data Room Accessed / NDA Executed";
 
 function normalizeName(name) {
   return String(name || "")
@@ -38,16 +50,110 @@ async function fetchAllEntries() {
   return entries;
 }
 
-async function updateStatus(entryId, optionId) {
-  await V2.post(`/lists/${LIST_ID}/list-entries/${entryId}/fields/${FIELD_STATUS}`,
+async function fetchStatusFieldAndOptions() {
+  const { data } = await V2.get(`/lists/${LIST_ID}/fields`);
+  const fields = data?.data || [];
+  // Prefer explicit env var if provided
+  const desiredName = String(process.env.STATUS_FIELD_NAME || "Status").toLowerCase();
+  let statusField = fields.find(f => String(f?.name || "").toLowerCase() === desiredName);
+  if (!statusField) {
+    // Fallback: any dropdown-like field whose name contains 'status'
+    statusField = fields.find(f => /status/i.test(String(f?.name || "")));
+  }
+  if (!statusField) throw new Error("Could not find Status field on this list");
+
+  const options = statusField.dropdown_options || statusField.dropdownOptions || statusField.options || [];
+  const labelToId = new Map(options.map(o => [String(o?.name || o?.label || "").toLowerCase(), o?.id]));
+  return { statusFieldId: statusField.id, labelToId, field: statusField };
+}
+
+async function updateStatus(entryId, statusFieldId, optionId) {
+  await V2.post(`/lists/${LIST_ID}/list-entries/${entryId}/fields/${statusFieldId}`,
     { value: { type: "dropdown", data: optionId } }
   );
+}
+
+function deriveStatusLabelFromRow(row) {
+  const get = (k) => String(row[k] ?? row[String(k).replace(/^\s+|\s+$/g, "")] ?? "").trim();
+  const lower = (s) => String(s || "").toLowerCase();
+  const anyVal = (re) => {
+    for (const k of Object.keys(row)) {
+      if (re.test(k)) return String(row[k] ?? "");
+    }
+    return "";
+  };
+
+  const prospectStatus = lower(get("Prospect Status"));
+  const subscriptionStatus = lower(get("Subscription Status"));
+  const latestUpdate = lower(get("Latest update"));
+  const dataRoomGranted = lower(get("Data room granted"));
+  const dataRoomLastAccessed = lower(get("Data room last accessed")) || lower(get("Data room access detail")) || lower(get(" Data room access detail")) || lower(anyVal(/data\s*room.*access/i));
+  const dataRoomGrantDetail = lower(get("Data room grant detail")) || lower(get(" Data room grant detail"));
+
+  // 1) Sub docs signed/sent from subscription status
+  if (/counter\s*-?signed|fully\s*executed|executed|signed/.test(subscriptionStatus)) {
+    return "Sub Docs Signed";
+  }
+  if (/ready/.test(subscriptionStatus) && /sub/.test(subscriptionStatus)) {
+    return "Ready for Sub Docs";
+  }
+  if (/sent|issued|delivered/.test(subscriptionStatus)) {
+    return "Sub Docs Sent";
+  }
+
+  // 2) Committed
+  if (prospectStatus === "committed" || /committed/.test(subscriptionStatus)) {
+    return "Committed";
+  }
+
+  // 3) Ready / Verbal
+  if (/ready/.test(prospectStatus) && /sub/.test(prospectStatus)) {
+    return "Ready for Sub Docs";
+  }
+  if (/verbal/.test(prospectStatus) || /verbal\s*commit/.test(latestUpdate)) {
+    return "Verbal Commit";
+  }
+
+  // 4) Data room
+  if (dataRoomLastAccessed && !/not yet accessed|not\s*yet/.test(dataRoomLastAccessed)) {
+    return "Data Room Accessed / NDA Executed";
+  }
+  if (dataRoomGrantDetail || /invitation.*data\s*room/.test(latestUpdate) || /granted|yes|y/.test(dataRoomGranted)) {
+    return "Invited to Data Room";
+  }
+
+  // 5) Deck & PPM sent
+  if (/ppm|pitch\s*deck|deck\s*sent/.test(latestUpdate)) {
+    return "Deck & PPM Sent";
+  }
+
+  // 6) Meeting stages
+  if (/first\s*meeting|meeting\s+scheduled|intro\s*call|intro\b/.test(latestUpdate) || /intro|first\s*meeting/.test(prospectStatus)) {
+    return "Intro/First Meeting";
+  }
+  if (/contacted|engaged|early\s*dialogue/.test(prospectStatus)) {
+    return "Early Dialogue (Post-Intro)";
+  }
+
+  // 7) Target identified / new
+  if (/target\s*identified/.test(prospectStatus) || prospectStatus === "new") {
+    return "Target Identified";
+  }
+
+  return "";
 }
 
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Use POST" });
     if (!process.env.AFFINITY_V2_TOKEN) return res.status(500).json({ ok: false, error: "Missing AFFINITY_V2_TOKEN" });
+
+    const isDryRun = (() => {
+      try {
+        const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        return url.searchParams.get('dry') === '1';
+      } catch { return false; }
+    })();
 
     // Read body (support multipart or raw text); simplest path: expect text/csv in body
     const contentType = String(req.headers["content-type"] || "").toLowerCase();
@@ -78,25 +184,29 @@ export default async function handler(req, res) {
       skip_empty_lines: true
     });
 
-    // Expect columns: Name, Status (adjust as needed)
-    const wants = records.map(r => ({
-      name: String(r.Name || r["Investor Name"] || r["LP Name"] || "").trim(),
-      status: String(r.Status || r["Sub Docs Status"] || r["Stage"] || "").trim()
-    })).filter(r => r.name && r.status);
+    // Expect a name column; status may be direct or derived
+    const wantsRaw = records.map(r => ({
+      name: String(r.Name || r["Investor Name"] || r["LP Name"] || r["Organization"] || r["Contacts"] || r["Contact"] || "").split(';')[0].trim(),
+      raw: r
+    })).filter(r => r.name);
+    if (!wantsRaw.length) return res.status(400).json({ ok: false, error: "CSV has no Name column" });
 
-    if (!wants.length) return res.status(400).json({ ok: false, error: "CSV has no Name/Status rows" });
+    // Discover Status field + options from Affinity
+    const { statusFieldId, labelToId, field: statusField } = await fetchStatusFieldAndOptions();
 
     // Load Affinity entries and build a normalized name index
     const entries = await fetchAllEntries();
     const nameToEntry = new Map();
     for (const e of entries) {
-      const nm = normalizeName(e?.entity?.name || e?.entity?.first_name && `${e.entity.first_name} ${e.entity.last_name}` || "");
+      const nm = normalizeName(e?.entity?.name || (e?.entity?.first_name && `${e.entity.first_name} ${e.entity.last_name}`) || "");
       if (nm) nameToEntry.set(nm, e);
     }
 
+    const minIdx = STATUS_ORDER.findIndex(s => s.toLowerCase() === String(MIN_STATUS_LABEL).toLowerCase());
+
     const results = [];
-    for (const row of wants) {
-      const targetNorm = normalizeName(row.name);
+    for (const rec of wantsRaw) {
+      const targetNorm = normalizeName(rec.name);
       let entry = nameToEntry.get(targetNorm);
 
       // Fallback fuzzy
@@ -108,26 +218,53 @@ export default async function handler(req, res) {
         }
       }
 
+      const statusLabel = deriveStatusLabelFromRow(rec.raw);
       if (!entry) {
-        results.push({ name: row.name, status: row.status, matched: false });
+        results.push({ name: rec.name, statusLabel, matched: false });
         continue;
       }
 
-      const optionId = STATUS_LABEL_TO_OPTION_ID[row.status] || null;
+      // Enforce minimum status threshold (default: at or after NDA stage)
+      const idx = STATUS_ORDER.findIndex(s => s.toLowerCase() === String(statusLabel || "").toLowerCase());
+      if (idx === -1 || (minIdx !== -1 && idx < minIdx)) {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Status before minimum threshold (${MIN_STATUS_LABEL})` });
+        continue;
+      }
+
+      const normalizedStatus = String(statusLabel || "").toLowerCase();
+      let optionId = labelToId.get(normalizedStatus);
       if (!optionId) {
-        results.push({ name: row.name, status: row.status, matched: true, entryId: entry.id, updated: false, reason: "Unknown status label; map it in STATUS_LABEL_TO_OPTION_ID" });
+        // Fuzzy match against option labels
+        const labels = Array.from(labelToId.keys());
+        if (labels.length) {
+          const { bestMatch } = stringSimilarity.findBestMatch(normalizedStatus, labels);
+          if (bestMatch && bestMatch.rating >= 0.92) optionId = labelToId.get(bestMatch.target);
+        }
+      }
+
+      if (!statusLabel) {
+        results.push({ name: rec.name, matched: true, entryId: entry.id, updated: false, reason: "Could not derive status from CSV row" });
+        continue;
+      }
+      if (!optionId) {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for Affinity field '${statusField.name}'` });
+        continue;
+      }
+
+      if (isDryRun) {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, wouldUpdate: true });
         continue;
       }
 
       try {
-        await updateStatus(entry.id, optionId);
-        results.push({ name: row.name, status: row.status, matched: true, entryId: entry.id, updated: true });
+        await updateStatus(entry.id, statusFieldId, optionId);
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: true });
       } catch (e) {
-        results.push({ name: row.name, status: row.status, matched: true, entryId: entry.id, updated: false, error: e?.response?.data || e.message });
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, error: e?.response?.data || e.message });
       }
     }
 
-    return res.status(200).json({ ok: true, total: wants.length, results });
+    return res.status(200).json({ ok: true, total: wantsRaw.length, results });
   } catch (e) {
     const status = e?.response?.status || 500;
     const data = e?.response?.data || e.message;
