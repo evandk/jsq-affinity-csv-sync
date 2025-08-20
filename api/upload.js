@@ -128,6 +128,14 @@ function deriveStatusLabelFromRow(row) {
   const dataRoomLastAccessed = lower(get("Data room last accessed")) || lower(get("Data room access detail")) || lower(get(" Data room access detail")) || lower(anyVal(/data\s*room.*access/i));
   const dataRoomGrantDetail = lower(get("Data room grant detail")) || lower(get(" Data room grant detail"));
 
+  // Pre‑NDA onboarded: treat as "New" so we skip updating (below threshold)
+  const isPreNDA = !dataRoomGrantDetail && !/granted|yes|y/.test(dataRoomGranted) && !dataRoomLastAccessed;
+  const isEarlyProspect = prospectStatus === 'new' || prospectStatus.includes('target') || prospectStatus.includes('intro') || prospectStatus.includes('contacted');
+  const noSubdocProgress = !subscriptionStatus || /not started|pending|draft/.test(subscriptionStatus);
+  if (isPreNDA && isEarlyProspect && noSubdocProgress) {
+    return "New";
+  }
+
   // 1) Sub docs signed/sent from subscription status
   if (/counter\s*-?signed|fully\s*executed|executed|signed/.test(subscriptionStatus)) {
     return "Sub Docs Signed";
