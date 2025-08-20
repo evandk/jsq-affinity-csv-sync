@@ -34,12 +34,12 @@ const REQUIRE_API_KEY = process.env.CSV_SYNC_API_KEY ? true : false;
 const REDACT_RESPONSE = process.env.REDACT_RESPONSE === '1';
 
 function normalizeName(name) {
-  return String(name || "")
+  const raw = String(name || "").normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return raw
     .toLowerCase()
-    .replace(/[,\.]/g, " ")
-    .replace(/\s+lp\b|\s+llc\b|\s+ltd\b|\s+inc\b|\s+co\b|\s+corp\b|\s+partners?\b|\s+capital\b|\s+ventures?\b|\s+management\b|\s+holdings?\b/gi, "")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function isAuthorized(req) {
@@ -168,6 +168,33 @@ function deriveStatusLabelFromRow(row) {
   return "";
 }
 
+function resolveStatusOptionId(statusLabel, labelToId) {
+  if (!statusLabel) return null;
+  const norm = String(statusLabel).toLowerCase();
+  // Direct
+  if (labelToId.has(norm)) return labelToId.get(norm);
+  const labels = Array.from(labelToId.keys());
+  // Synonym patterns
+  const pickBy = (patterns) => labels.find(l => patterns.every(p => l.includes(p)));
+  const byPatterns = (
+    (norm.includes('data room') && norm.includes('nda') && pickBy(['data','room'])) ||
+    (norm.includes('ready') && norm.includes('sub') && pickBy(['ready','sub'])) ||
+    (norm.includes('sub') && norm.includes('signed') && (pickBy(['sign']) || pickBy(['execut']))) ||
+    (norm.includes('sub') && norm.includes('sent') && pickBy(['sent'])) ||
+    (norm.includes('verbal') && pickBy(['verbal'])) ||
+    (norm.includes('deck') || norm.includes('ppm')) && pickBy(['sent']) ||
+    (norm.includes('intro') && pickBy(['intro'])) ||
+    (norm.includes('early') && pickBy(['early'])) ||
+    (norm.includes('target') && pickBy(['target'])) ||
+    (norm.includes('commit') && pickBy(['commit'])) || null
+  );
+  if (byPatterns && labelToId.has(byPatterns)) return labelToId.get(byPatterns);
+  // Fuzzy
+  const { bestMatch } = stringSimilarity.findBestMatch(norm, labels);
+  if (bestMatch && bestMatch.rating >= 0.85) return labelToId.get(bestMatch.target);
+  return null;
+}
+
 function redact(results) {
   if (!REDACT_RESPONSE) return results;
   return results.map(r => ({
@@ -251,11 +278,11 @@ export default async function handler(req, res) {
       const targetNorm = normalizeName(rec.name);
       let entry = nameToEntry.get(targetNorm);
 
-      // Fallback fuzzy
+      // Fallback fuzzy (slightly lower threshold)
       if (!entry) {
         const candidates = Array.from(nameToEntry.keys());
         const { bestMatch } = stringSimilarity.findBestMatch(targetNorm, candidates);
-        if (bestMatch && bestMatch.rating >= 0.92) {
+        if (bestMatch && bestMatch.rating >= 0.88) {
           entry = nameToEntry.get(bestMatch.target);
         }
       }
@@ -273,16 +300,7 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const normalizedStatus = String(statusLabel || "").toLowerCase();
-      let optionId = labelToId.get(normalizedStatus);
-      if (!optionId) {
-        // Fuzzy match against option labels
-        const labels = Array.from(labelToId.keys());
-        if (labels.length) {
-          const { bestMatch } = stringSimilarity.findBestMatch(normalizedStatus, labels);
-          if (bestMatch && bestMatch.rating >= 0.92) optionId = labelToId.get(bestMatch.target);
-        }
-      }
+      const optionId = resolveStatusOptionId(statusLabel, labelToId);
 
       if (!statusLabel) {
         results.push({ name: rec.name, matched: true, entryId: entry.id, updated: false, reason: "Could not derive status from CSV row" });
