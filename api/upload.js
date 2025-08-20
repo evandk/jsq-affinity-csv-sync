@@ -42,6 +42,19 @@ function normalizeName(name) {
     .replace(/\s+/g, " ");
 }
 
+function safeBestMatch(main, arr, minScore = 0.92) {
+  try {
+    const query = String(main ?? "");
+    const candidates = Array.isArray(arr) ? arr.map(x => String(x ?? "")).filter(s => s.length > 0) : [];
+    if (!query || candidates.length === 0) return null;
+    const { bestMatch } = stringSimilarity.findBestMatch(query, candidates);
+    if (bestMatch && bestMatch.rating >= minScore) return bestMatch.target;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function isAuthorized(req) {
   if (!REQUIRE_API_KEY) return true;
   const apiKey = process.env.CSV_SYNC_API_KEY;
@@ -182,17 +195,16 @@ function resolveStatusOptionId(statusLabel, labelToId) {
     (norm.includes('sub') && norm.includes('signed') && (pickBy(['sign']) || pickBy(['execut']))) ||
     (norm.includes('sub') && norm.includes('sent') && pickBy(['sent'])) ||
     (norm.includes('verbal') && pickBy(['verbal'])) ||
-    (norm.includes('deck') || norm.includes('ppm')) && pickBy(['sent']) ||
+    ((norm.includes('deck') || norm.includes('ppm')) && pickBy(['sent'])) ||
     (norm.includes('intro') && pickBy(['intro'])) ||
     (norm.includes('early') && pickBy(['early'])) ||
     (norm.includes('target') && pickBy(['target'])) ||
     (norm.includes('commit') && pickBy(['commit'])) || null
   );
   if (byPatterns && labelToId.has(byPatterns)) return labelToId.get(byPatterns);
-  // Fuzzy
-  const { bestMatch } = stringSimilarity.findBestMatch(norm, labels);
-  if (bestMatch && bestMatch.rating >= 0.85) return labelToId.get(bestMatch.target);
-  return null;
+  // Fuzzy (safe)
+  const target = safeBestMatch(norm, labels, 0.85);
+  return target ? labelToId.get(target) : null;
 }
 
 function redact(results) {
@@ -278,13 +290,11 @@ export default async function handler(req, res) {
       const targetNorm = normalizeName(rec.name);
       let entry = nameToEntry.get(targetNorm);
 
-      // Fallback fuzzy (slightly lower threshold)
+      // Fallback fuzzy (safe)
       if (!entry) {
         const candidates = Array.from(nameToEntry.keys());
-        const { bestMatch } = stringSimilarity.findBestMatch(targetNorm, candidates);
-        if (bestMatch && bestMatch.rating >= 0.88) {
-          entry = nameToEntry.get(bestMatch.target);
-        }
+        const target = safeBestMatch(targetNorm, candidates, 0.88);
+        if (target) entry = nameToEntry.get(target);
       }
 
       const statusLabel = deriveStatusLabelFromRow(rec.raw);
