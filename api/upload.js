@@ -121,7 +121,7 @@ function mergeManualOverrides(labelToId) {
   } catch {/* ignore */}
 }
 
-function applyAlias(targetLabel, labelToId) {
+function applyAlias(targetLabel) {
   try {
     const raw = process.env.STATUS_LABEL_ALIASES_JSON;
     if (!raw) return targetLabel;
@@ -155,10 +155,15 @@ async function fetchStatusFieldAndOptions() {
   return { statusFieldId: statusField.id, labelToId, field: statusField };
 }
 
-async function updateStatus(entryId, statusFieldId, optionId) {
-  await V2.post(`/lists/${LIST_ID}/list-entries/${entryId}/fields/${statusFieldId}`,
-    { value: { type: "dropdown", data: optionId } }
-  );
+async function updateStatus(entryId, statusFieldId, optionId, valueType) {
+  const type = String(valueType || 'ranked-dropdown');
+  const payload = {
+    value: {
+      type,
+      data: { dropdownOptionId: optionId }
+    }
+  };
+  await V2.post(`/lists/${LIST_ID}/list-entries/${entryId}/fields/${statusFieldId}`, payload);
 }
 
 function deriveStatusLabelFromRow(row) {
@@ -241,7 +246,7 @@ function deriveStatusLabelFromRow(row) {
 
 function resolveStatusOptionId(statusLabel, labelToId) {
   if (!statusLabel) return null;
-  const effective = applyAlias(statusLabel, labelToId);
+  const effective = applyAlias(statusLabel);
   const norm = String(effective).toLowerCase();
   // Direct
   if (labelToId.has(norm)) return labelToId.get(norm);
@@ -407,7 +412,7 @@ export default async function handler(req, res) {
       }
 
       try {
-        await updateStatus(entry.id, statusFieldId, optionId);
+        await updateStatus(entry.id, statusFieldId, optionId, statusField.valueType || statusField.value_type);
         results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: true });
       } catch (e) {
         results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, error: e?.response?.data || e.message });
