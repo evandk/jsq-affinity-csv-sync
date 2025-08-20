@@ -88,6 +88,26 @@ async function fetchAllEntries() {
   return entries;
 }
 
+async function buildLabelMapFromEntries(statusFieldId) {
+  const labelToId = new Map();
+  let nextUrl = `/lists/${LIST_ID}/list-entries?fieldIds[]=${encodeURIComponent(statusFieldId)}`;
+  while (nextUrl) {
+    const { data } = await V2.get(nextUrl);
+    const entries = data?.data || [];
+    for (const e of entries) {
+      const f = (e.fields || []).find(x => String(x.id) === String(statusFieldId));
+      const v = f?.value?.data;
+      const text = v?.text;
+      const optId = v?.dropdownOptionId;
+      if (text && optId) {
+        labelToId.set(String(text).toLowerCase(), optId);
+      }
+    }
+    nextUrl = data?.pagination?.nextUrl || null;
+  }
+  return labelToId;
+}
+
 async function fetchStatusFieldAndOptions() {
   const { data } = await V2.get(`/lists/${LIST_ID}/fields`);
   const fields = data?.data || [];
@@ -101,7 +121,11 @@ async function fetchStatusFieldAndOptions() {
   if (!statusField) throw new Error("Could not find Status field on this list");
 
   const options = statusField.dropdown_options || statusField.dropdownOptions || statusField.options || [];
-  const labelToId = new Map(options.map(o => [String(o?.name || o?.label || "").toLowerCase(), o?.id]));
+  let labelToId = new Map(options.map(o => [String(o?.name || o?.label || "").toLowerCase(), o?.id]));
+  // Fallback: learn map by scanning entries when options are not available via fields API
+  if (labelToId.size === 0) {
+    labelToId = await buildLabelMapFromEntries(statusField.id);
+  }
   return { statusFieldId: statusField.id, labelToId, field: statusField };
 }
 
