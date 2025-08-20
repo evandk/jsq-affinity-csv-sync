@@ -155,7 +155,6 @@ function applyAlias(targetLabel) {
   } catch { return targetLabel; }
 }
 
-// Optional: override sub-status mapping via env
 function mapSubStatusWithOverrides(sub) {
   try {
     const raw = process.env.SUB_STATUS_TO_STAGE_JSON;
@@ -164,6 +163,24 @@ function mapSubStatusWithOverrides(sub) {
     const key = String(sub || '').toLowerCase();
     return obj[key] || null;
   } catch { return null; }
+}
+
+function accessedFromDetail(detailRaw) {
+  const raw = String(detailRaw || '').trim();
+  if (!raw) return false;
+  const parts = raw.split(';');
+  for (let part of parts) {
+    const p = part.trim().toLowerCase();
+    if (!p) continue;
+    if (p.includes('not yet accessed') || p.includes('not yet')) {
+      continue;
+    }
+    // any date-like token or digits imply accessed
+    if (/[0-9]/.test(p) || /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(part)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function fetchStatusFieldAndOptions() {
@@ -218,14 +235,16 @@ function deriveStatusLabelFromRow(row) {
   if (override) return override;
 
   const dataRoomGranted = lower(get("Data room granted"));
-  const dataRoomLastAccessed = lower(get("Data room last accessed")) || lower(get("Data room access detail")) || lower(get(" Data room access detail")) || lower(anyVal(/data\s*room.*access/i));
+  const dataRoomAccessDetailRaw = get("Data room access detail") || get(" Data room access detail") || anyVal(/data\s*room.*access/i);
+  const dataRoomLastAccessed = lower(get("Data room last accessed"));
 
   // High-priority from subscription
   if (/counter\s*-?signed|fully\s*executed|executed|signed/.test(sub)) return "Sub Docs Signed";
   if (/awaiting.*investor.*signature|staff review/.test(sub)) return "Ready for Sub Docs";
   if (/started|draft|invited/.test(sub)) return "Sub Docs Sent";
 
-  // Data room signals
+  // Data room signals (detail first, then explicit last accessed)
+  if (accessedFromDetail(dataRoomAccessDetailRaw)) return "Data Room Accessed / NDA Executed";
   if (dataRoomLastAccessed && !/not yet accessed|not\s*yet/.test(dataRoomLastAccessed)) return "Data Room Accessed / NDA Executed";
   if (/granted|yes|y/.test(dataRoomGranted)) return "Invited to Data Room";
 
