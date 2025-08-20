@@ -78,6 +78,21 @@ function isAuthorized(req) {
   return false;
 }
 
+function isPassedLabel(label) {
+  const l = String(label || '').trim().toLowerCase();
+  return l === 'passed' || l === 'declined' || l === 'no go' || l === 'no-go' || l === 'nog o';
+}
+
+async function fetchEntryStatusLabel(entryId, statusFieldId) {
+  try {
+    const { data } = await V2.get(`/lists/${LIST_ID}/list-entries/${entryId}/fields`);
+    const field = (data?.data || []).find(f => String(f.id) === String(statusFieldId));
+    return field?.value?.data?.text || '';
+  } catch {
+    return '';
+  }
+}
+
 async function fetchEntriesWithStatus(statusFieldId) {
   const entries = [];
   const currentStatusById = new Map();
@@ -353,13 +368,15 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // Enforce minimum threshold and non-downgrade
-      const currentLabel = String(currentStatusById.get(entry.id) || "");
-      if (currentLabel.toLowerCase() === 'passed') {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: 'Currently Passed; no change' });
+      // Hard lock: do not change if currently Passed (or synonyms). Use bulk map, then per-entry fallback.
+      let currentLabel = String(currentStatusById.get(entry.id) || "");
+      if (!currentLabel) currentLabel = await fetchEntryStatusLabel(entry.id, statusFieldId);
+      if (isPassedLabel(currentLabel)) {
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Currently '${currentLabel}'; no change` });
         continue;
       }
 
+      // Enforce minimum threshold and non-downgrade
       const currentIdx = STATUS_INDEX.get(currentLabel.toLowerCase());
       const derivedIdx = STATUS_INDEX.get(String(statusLabel || '').toLowerCase());
 
