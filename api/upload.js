@@ -28,7 +28,7 @@ const STATUS_ORDER = [
   "Sub Docs Signed",
   "Committed"
 ];
-const MIN_STATUS_LABEL = process.env.MIN_STATUS_LABEL || "Data Room Accessed / NDA Executed";
+const MIN_STATUS_LABEL = process.env.MIN_STATUS_LABEL || "Invited to Data Room";
 const MAX_CSV_BYTES = Number(process.env.MAX_CSV_BYTES || 2_000_000); // ~2MB default
 const REQUIRE_API_KEY = process.env.CSV_SYNC_API_KEY ? true : false;
 const REDACT_RESPONSE = process.env.REDACT_RESPONSE === '1';
