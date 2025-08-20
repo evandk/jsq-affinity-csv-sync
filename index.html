@@ -12,15 +12,25 @@
       pre { background: #fafafa; padding: 1rem; border: 1px solid #eee; border-radius: 6px; overflow: auto; }
       button { padding: 0.5rem 1rem; border: 1px solid #555; border-radius: 6px; background: #111; color: #fff; cursor: pointer; }
       button:disabled { opacity: 0.5; cursor: not-allowed; }
+      input[type=text], input[type=password] { width: 100%; max-width: 420px; padding: 0.4rem 0.5rem; }
+      label { display: inline-flex; align-items: center; gap: 0.5rem; }
     </style>
   </head>
   <body>
     <h1>Juniper Square → Affinity CSV Sync</h1>
     <div class="box">
       <div class="row">Upload the latest CSV export from Juniper Square. We'll match by name (exact, then fuzzy) and update the Status dropdown in Affinity.</div>
-      <div class="row"><strong>Note:</strong> You must configure STATUS_LABEL_TO_OPTION_ID on the server to map CSV labels to Affinity dropdown option IDs.</div>
+      <div class="row"><strong>Secure:</strong> This endpoint requires an API key. Set it below; your key is validated server-side. You can also run a preview-only sync (no writes).</div>
+      <div class="row">
+        <label>API Key (required)
+          <input id="apiKey" type="password" placeholder="CSV_SYNC_API_KEY" autocomplete="off" />
+        </label>
+      </div>
       <div class="row">
         <input id="file" type="file" accept=".csv,text/csv" />
+        <label><input id="dry" type="checkbox" /> Preview only (dry‑run)</label>
+      </div>
+      <div class="row">
         <button id="send">Upload & Sync</button>
       </div>
       <div class="row">
@@ -31,17 +41,22 @@
       const fileEl = document.getElementById('file');
       const sendBtn = document.getElementById('send');
       const out = document.getElementById('out');
+      const apiKeyEl = document.getElementById('apiKey');
+      const dryEl = document.getElementById('dry');
 
       async function uploadCsv() {
         const f = fileEl.files[0];
         if (!f) { out.textContent = 'Please choose a CSV file.'; return; }
+        const apiKey = apiKeyEl.value.trim();
+        if (!apiKey) { out.textContent = 'Please enter the API key.'; return; }
         sendBtn.disabled = true;
         out.textContent = 'Uploading…';
         try {
           const text = await f.text();
-          const resp = await fetch('/api/upload', {
+          const url = dryEl.checked ? '/api/upload?dry=1' : '/api/upload';
+          const resp = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'text/csv' },
+            headers: { 'Content-Type': 'text/csv', 'x-api-key': apiKey },
             body: text
           });
           const data = await resp.json();
