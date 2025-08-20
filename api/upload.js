@@ -108,6 +108,30 @@ async function buildLabelMapFromEntries(statusFieldId) {
   return labelToId;
 }
 
+function mergeManualOverrides(labelToId) {
+  try {
+    const raw = process.env.STATUS_LABEL_TO_ID_JSON;
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    Object.entries(obj).forEach(([k, v]) => {
+      const key = String(k).toLowerCase();
+      const val = Number(v);
+      if (Number.isFinite(val)) labelToId.set(key, val);
+    });
+  } catch {/* ignore */}
+}
+
+function applyAlias(targetLabel, labelToId) {
+  try {
+    const raw = process.env.STATUS_LABEL_ALIASES_JSON;
+    if (!raw) return targetLabel;
+    const obj = JSON.parse(raw);
+    const lower = String(targetLabel || '').toLowerCase();
+    const alias = obj[lower];
+    return alias || targetLabel;
+  } catch { return targetLabel; }
+}
+
 async function fetchStatusFieldAndOptions() {
   const { data } = await V2.get(`/lists/${LIST_ID}/fields`);
   const fields = data?.data || [];
@@ -126,6 +150,8 @@ async function fetchStatusFieldAndOptions() {
   if (labelToId.size === 0) {
     labelToId = await buildLabelMapFromEntries(statusField.id);
   }
+  // Manual overrides (hard-coded mapping)
+  mergeManualOverrides(labelToId);
   return { statusFieldId: statusField.id, labelToId, field: statusField };
 }
 
@@ -215,27 +241,48 @@ function deriveStatusLabelFromRow(row) {
 
 function resolveStatusOptionId(statusLabel, labelToId) {
   if (!statusLabel) return null;
-  const norm = String(statusLabel).toLowerCase();
+  const effective = applyAlias(statusLabel, labelToId);
+  const norm = String(effective).toLowerCase();
   // Direct
   if (labelToId.has(norm)) return labelToId.get(norm);
   const labels = Array.from(labelToId.keys());
-  // Synonym patterns
-  const pickBy = (patterns) => labels.find(l => patterns.every(p => l.includes(p)));
-  const byPatterns = (
-    (norm.includes('data room') && norm.includes('nda') && pickBy(['data','room'])) ||
-    (norm.includes('ready') && norm.includes('sub') && pickBy(['ready','sub'])) ||
-    (norm.includes('sub') && norm.includes('signed') && (pickBy(['sign']) || pickBy(['execut']))) ||
-    (norm.includes('sub') && norm.includes('sent') && pickBy(['sent'])) ||
-    (norm.includes('verbal') && pickBy(['verbal'])) ||
-    ((norm.includes('deck') || norm.includes('ppm')) && pickBy(['sent'])) ||
-    (norm.includes('intro') && pickBy(['intro'])) ||
-    (norm.includes('early') && pickBy(['early'])) ||
-    (norm.includes('target') && pickBy(['target'])) ||
-    (norm.includes('commit') && pickBy(['commit'])) || null
-  );
-  if (byPatterns && labelToId.has(byPatterns)) return labelToId.get(byPatterns);
+  // Synonym patterns (broadened)
+  const hasAll = (l, pats) => pats.every(p => l.includes(p));
+  const pickBy = (patternsArr) => labels.find(l => hasAll(l, patternsArr));
+  let candidate = null;
+  if (!candidate && (norm.includes('data') || norm.includes('nda'))) {
+    candidate = pickBy(['nda']) || pickBy(['data','room']) || pickBy(['access']);
+  }
+  if (!candidate && norm.includes('ready')) {
+    candidate = pickBy(['ready','sub']) || pickBy(['ready','doc']);
+  }
+  if (!candidate && norm.includes('sent')) {
+    candidate = pickBy(['sent','sub']) || pickBy(['sent','doc']);
+  }
+  if (!candidate && norm.includes('signed')) {
+    candidate = pickBy(['sign','sub']) || pickBy(['execut']);
+  }
+  if (!candidate && norm.includes('verbal')) {
+    candidate = pickBy(['verbal']);
+  }
+  if (!candidate && (norm.includes('deck') || norm.includes('ppm'))) {
+    candidate = pickBy(['deck']) || pickBy(['ppm']) || pickBy(['material']);
+  }
+  if (!candidate && norm.includes('intro')) {
+    candidate = pickBy(['intro']);
+  }
+  if (!candidate && norm.includes('early')) {
+    candidate = pickBy(['early']);
+  }
+  if (!candidate && norm.includes('target')) {
+    candidate = pickBy(['target']) || pickBy(['new']);
+  }
+  if (!candidate && norm.includes('commit')) {
+    candidate = pickBy(['commit']);
+  }
+  if (candidate && labelToId.has(candidate)) return labelToId.get(candidate);
   // Fuzzy (safe)
-  const target = safeBestMatch(norm, labels, 0.85);
+  const target = safeBestMatch(norm, labels, 0.80);
   return target ? labelToId.get(target) : null;
 }
 
@@ -315,6 +362,7 @@ export default async function handler(req, res) {
       if (nm) nameToEntry.set(nm, e);
     }
 
+    const knownOptions = Array.from(new Set(Array.from(labelToId.keys())));
     const minIdx = STATUS_ORDER.findIndex(s => s.toLowerCase() === String(MIN_STATUS_LABEL).toLowerCase());
 
     const results = [];
@@ -349,7 +397,7 @@ export default async function handler(req, res) {
         continue;
       }
       if (!optionId) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for Affinity field '${statusField.name}'` });
+        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for Affinity field '${statusField.name}'`, knownOptions });
         continue;
       }
 
