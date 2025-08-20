@@ -155,6 +155,17 @@ function applyAlias(targetLabel) {
   } catch { return targetLabel; }
 }
 
+// Optional: override sub-status mapping via env
+function mapSubStatusWithOverrides(sub) {
+  try {
+    const raw = process.env.SUB_STATUS_TO_STAGE_JSON;
+    if (!raw) return null;
+    const obj = JSON.parse(raw); // keys lowercased
+    const key = String(sub || '').toLowerCase();
+    return obj[key] || null;
+  } catch { return null; }
+}
+
 async function fetchStatusFieldAndOptions() {
   const { data } = await V2.get(`/lists/${LIST_ID}/fields`);
   const fields = data?.data || [];
@@ -200,14 +211,19 @@ function deriveStatusLabelFromRow(row) {
   };
 
   // Prefer subscription and data room signals
-  const sub = lower(get("Subscription Status")) || lower(get("Subscription")) || anyVal(/subscription\s*status/i).toLowerCase();
+  const subRaw = get("Subscription Status") || get("Subscription");
+  const subAny = anyVal(/subscription/i);
+  const sub = lower(subRaw || subAny);
+  const override = mapSubStatusWithOverrides(sub);
+  if (override) return override;
+
   const dataRoomGranted = lower(get("Data room granted"));
   const dataRoomLastAccessed = lower(get("Data room last accessed")) || lower(get("Data room access detail")) || lower(get(" Data room access detail")) || lower(anyVal(/data\s*room.*access/i));
 
   // High-priority from subscription
   if (/counter\s*-?signed|fully\s*executed|executed|signed/.test(sub)) return "Sub Docs Signed";
-  if (/awaiting.*investor.*signature|staff review|started|draft/.test(sub)) return "Ready for Sub Docs";
-  if (/invited/.test(sub)) return "Sub Docs Sent";
+  if (/awaiting.*investor.*signature|staff review/.test(sub)) return "Ready for Sub Docs";
+  if (/started|draft|invited/.test(sub)) return "Sub Docs Sent";
 
   // Data room signals
   if (dataRoomLastAccessed && !/not yet accessed|not\s*yet/.test(dataRoomLastAccessed)) return "Data Room Accessed / NDA Executed";
