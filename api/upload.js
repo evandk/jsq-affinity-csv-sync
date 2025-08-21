@@ -91,12 +91,14 @@ function loadNicknameAliases() {
     "jonathan": ["jon"],
     "joshua": ["josh"],
     "katherine": ["kate", "katie", "kat"],
+    "louis": ["lou"],
     "matthew": ["matt"],
     "michael": ["mike"],
     "nicholas": ["nick"],
     "patrick": ["pat"],
     "robert": ["rob", "bob", "bobby"],
     "steven": ["steve"],
+    "stephen": ["steve"],
     "thomas": ["tom"],
     "william": ["will", "bill", "billy"]
   };
