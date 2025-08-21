@@ -217,6 +217,31 @@ async function updateStatus(entryId, statusFieldId, optionId, valueType) {
   await V2.post(`/lists/${LIST_ID}/list-entries/${entryId}/fields/${statusFieldId}`, payload);
 }
 
+// Safely read CSV body without destroying the request stream
+async function readCsvBody(req, limitBytes) {
+  return await new Promise((resolve) => {
+    let data = "";
+    let total = 0;
+    let done = false;
+    function finish(result) { if (done) return; done = true; resolve(result); }
+    try { req.setEncoding('utf8'); } catch {}
+    req.on('data', (chunk) => {
+      if (done) return;
+      total += chunk.length;
+      if (limitBytes && total > limitBytes) {
+        try { req.pause(); } catch {}
+        req.removeAllListeners('data');
+        req.removeAllListeners('end');
+        return finish({ text: "", tooLarge: true });
+      }
+      data += chunk;
+    });
+    req.on('end', () => finish({ text: data, tooLarge: false }));
+    req.on('error', () => finish({ text: "", tooLarge: false }));
+    req.on('aborted', () => finish({ text: "", tooLarge: false }));
+  });
+}
+
 function deriveStatusLabelFromRow(row) {
   const get = (k) => String(row[k] ?? row[String(k).replace(/^\s+|\s+$/g, "")] ?? "").trim();
   const lower = (s) => String(s || "").toLowerCase();
@@ -334,20 +359,23 @@ export default async function handler(req, res) {
       } catch { return false; }
     })();
 
-    // Read body (support multipart or raw text); simplest path: expect text/csv in body
+    // Read body (support raw text CSV or JSON { csv })
     const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    const contentLen = Number(req.headers['content-length'] || 0);
+    if (contentLen && contentLen > MAX_CSV_BYTES) {
+      return res.status(413).json({ ok: false, error: "CSV too large" });
+    }
+
     let csvText = "";
     if (contentType.includes("text/csv") || contentType.includes("application/octet-stream") || contentType.includes("text/plain")) {
-      csvText = typeof req.body === "string" ? req.body : (Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "");
-      if (!csvText) {
-        // raw stream fallback
-        csvText = await new Promise((resolve, reject) => {
-          let data = "";
-          let total = 0;
-          req.on("data", chunk => { total += chunk.length; if (total > MAX_CSV_BYTES) { req.destroy(); } else { data += chunk; } });
-          req.on("end", () => resolve(data));
-          req.on("error", reject);
-        });
+      if (typeof req.body === "string") {
+        csvText = req.body;
+      } else if (Buffer.isBuffer(req.body)) {
+        csvText = req.body.toString("utf8");
+      } else {
+        const { text, tooLarge } = await readCsvBody(req, MAX_CSV_BYTES);
+        if (tooLarge) return res.status(413).json({ ok: false, error: "CSV too large" });
+        csvText = text;
       }
     } else {
       // Support JSON uploads: { csv: "..." }
