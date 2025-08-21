@@ -627,7 +627,7 @@ export default async function handler(req, res) {
     if (!wantsRaw.length) return res.status(400).json({ ok: false, error: "CSV has neither Organization nor Person names" });
 
     // Discover Status field + options from Affinity
-    const { statusFieldId, labelToId, field: statusField, peopleFieldIds, orgFieldIds } = await fetchStatusFieldAndOptions();
+    const { statusFieldId, labelToId, field: statusField, peopleFieldIds, orgFieldIds } = await fetchStatusFieldAndOptionsWrapper();
 
     // Load Affinity entries and current status, then build type-specific indexes with associations
     const { entries, currentStatusById, associationsById } = await fetchEntriesWithStatus(statusFieldId, peopleFieldIds, orgFieldIds);
@@ -635,6 +635,10 @@ export default async function handler(req, res) {
     const personKeyToEntry = new Map();
     const orgKeys = new Set();
     const personKeys = new Set();
+
+    // Indices from associations (People/Org fields)
+    const personAssocKeyToEntries = new Map(); // key -> Entry[]
+    const orgAssocKeyToEntries = new Map();
 
     for (const e of entries) {
       const ent = e?.entity || {};
@@ -655,6 +659,22 @@ export default async function handler(req, res) {
           if (!orgKeyToEntry.has(key)) orgKeyToEntry.set(key, e);
           orgKeys.add(key);
         }
+      }
+      // Build assoc indices
+      const assoc = associationsById.get(e.id) || { assocPeople: [], assocOrgs: [] };
+      for (const pn of assoc.assocPeople || []) {
+        const variants = personKeyVariants(pn);
+        for (const v of variants) {
+          if (!personAssocKeyToEntries.has(v)) personAssocKeyToEntries.set(v, []);
+          const arr = personAssocKeyToEntries.get(v);
+          if (!arr.find(x => x.id === e.id)) arr.push(e);
+        }
+      }
+      for (const on of assoc.assocOrgs || []) {
+        const ok = normalizeOrgKey(on);
+        if (!orgAssocKeyToEntries.has(ok)) orgAssocKeyToEntries.set(ok, []);
+        const arr2 = orgAssocKeyToEntries.get(ok);
+        if (!arr2.find(x => x.id === e.id)) arr2.push(e);
       }
     }
 
@@ -753,7 +773,38 @@ export default async function handler(req, res) {
         }
       }
 
-      // If no pair found, fall back to type-only matching
+      // Fallback: use association indices when there is no direct entity match
+      if (!best.entry) {
+        // Person-only via associations → choose entry whose org matches CSV org if present
+        for (const name of rec.personCandidates) {
+          const variants = personKeyVariants(name);
+          for (const v of variants) {
+            const list = personAssocKeyToEntries.get(v) || [];
+            if (list.length === 1 && 0.95 > best.score) {
+              best = { entry: list[0], type: classifyEntityType(list[0]?.entity) === 'person' ? 'person' : 'organization', score: 0.95, name };
+            } else if (list.length > 1 && normalizedOrgCandidates.length) {
+              for (const e of list) {
+                const assoc = associationsById.get(e.id) || { assocOrgs: [] };
+                const assocOrgsNorm = (assoc.assocOrgs || []).map(normalizeOrgKey);
+                if (normalizedOrgCandidates.some(ok => assocOrgsNorm.includes(ok)) && 0.93 > best.score) {
+                  best = { entry: e, type: classifyEntityType(e?.entity) === 'person' ? 'person' : 'organization', score: 0.93, name };
+                  break;
+                }
+              }
+            }
+          }
+        }
+        // Org-only via associations
+        for (const name of rec.orgCandidates) {
+          const ok = normalizeOrgKey(name);
+          const list = orgAssocKeyToEntries.get(ok) || [];
+          if (list.length === 1 && 0.92 > best.score) {
+            best = { entry: list[0], type: 'organization', score: 0.92, name };
+          }
+        }
+      }
+
+      // If still no pair found, fall back to type-only matching
       if (!best.entry) {
         // Organizations
         for (const name of rec.orgCandidates) {
