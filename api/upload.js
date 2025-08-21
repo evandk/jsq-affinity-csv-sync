@@ -52,8 +52,8 @@ function stripLegalSuffixes(orgName) {
   const n = normalizeName(orgName);
   // remove common corporate suffixes at end
   return n
-    .replace(/\b(incorporated|inc|llc|l\.l\.c\.|ltd|limited|llp|l\.l\.p\.|lp|l\.p\.|plc|gmbh|sarl|s\.a\.|s\.a|ag|bv|b\.v\.)\b\.?$/g, "")
-    .replace(/\b(co|co\.|company|partners|partners?\b|holdings|capital)\b$/g, "")
+    .replace(/\b(incorporated|inc|ltd|limited|llc|l\.l\.c\.|llp|l\.l\.p\.|lp|l\.p\.|plc|gmbh|sarl|s\.a\.?|ag|bv|b\.v\.)\b\.?$/g, "")
+    .replace(/\b(co|co\.|company|partners|holdings|capital)\b$/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -64,7 +64,6 @@ function normalizeOrgKey(orgName) {
 
 function normalizePersonKey(name) {
   const n = normalizeName(name).replace(/\b(jr|sr|ii|iii|iv)\b/g, "").replace(/\s+/g, " ").trim();
-  // Prefer "first last"
   return n;
 }
 
@@ -194,10 +193,79 @@ async function fetchEntryStatusLabel(entryId, statusFieldId) {
   }
 }
 
-async function fetchEntriesWithStatus(statusFieldId) {
+function extractNamesFromValueData(val) {
+  const out = [];
+  if (!val) return out;
+  const consume = (obj) => {
+    if (!obj) return;
+    const n = obj.name || (obj.first_name && obj.last_name ? `${obj.first_name} ${obj.last_name}` : (obj.first_name || obj.last_name));
+    if (n) out.push(String(n));
+    else if (obj.text) out.push(String(obj.text));
+  };
+  if (Array.isArray(val)) {
+    val.forEach(consume);
+  } else if (Array.isArray(val.entities)) {
+    val.entities.forEach(consume);
+  } else if (val.entity) {
+    consume(val.entity);
+  } else if (val.name || val.first_name || val.last_name || val.text) {
+    consume(val);
+  }
+  return Array.from(new Set(out));
+}
+
+function extractAssociatedNamesFromFields(fields, peopleFieldId, orgFieldId) {
+  const assocPeople = [];
+  const assocOrgs = [];
+  for (const f of fields || []) {
+    if (peopleFieldId && String(f.id) === String(peopleFieldId)) {
+      const names = extractNamesFromValueData(f?.value?.data);
+      assocPeople.push(...names);
+    }
+    if (orgFieldId && String(f.id) === String(orgFieldId)) {
+      const names = extractNamesFromValueData(f?.value?.data);
+      assocOrgs.push(...names);
+    }
+  }
+  return { assocPeople: Array.from(new Set(assocPeople)), assocOrgs: Array.from(new Set(assocOrgs)) };
+}
+
+async function fetchStatusFieldAndOptions() {
+  const { data } = await V2.get(`/lists/${LIST_ID}/fields`);
+  const fields = data?.data || [];
+  // Prefer explicit env var if provided
+  const desiredName = String(process.env.STATUS_FIELD_NAME || "Status").toLowerCase();
+  let statusField = fields.find(f => String(f?.name || "").toLowerCase() === desiredName);
+  if (!statusField) {
+    // Fallback: any dropdown-like field whose name contains 'status'
+    statusField = fields.find(f => /status/i.test(String(f?.name || "")));
+  }
+  if (!statusField) throw new Error("Could not find Status field on this list");
+
+  // Detect People and Organization fields
+  const peopleField = fields.find(f => /^people$/i.test(String(f?.name || "")) || /\bpeople\b/i.test(String(f?.name || "")));
+  const orgField = fields.find(f => /^organization$/i.test(String(f?.name || "")) || /organiza/i.test(String(f?.name || "")));
+
+  const options = statusField.dropdown_options || statusField.dropdownOptions || statusField.options || [];
+  let labelToId = new Map(options.map(o => [String(o?.name || o?.label || "").toLowerCase(), o?.id]));
+  // Fallback: learn map by scanning entries when options are not available via fields API
+  if (labelToId.size === 0) {
+    labelToId = await buildLabelMapFromEntries(statusField.id);
+  }
+  // Manual overrides (hard-coded mapping)
+  mergeManualOverrides(labelToId);
+  return { statusFieldId: statusField.id, labelToId, field: statusField, peopleFieldId: peopleField?.id, orgFieldId: orgField?.id };
+}
+
+async function fetchEntriesWithStatus(statusFieldId, peopleFieldId, orgFieldId) {
   const entries = [];
   const currentStatusById = new Map();
-  let nextUrl = `/lists/${LIST_ID}/list-entries?fieldIds[]=${encodeURIComponent(statusFieldId)}`;
+  const associationsById = new Map();
+  const fids = [statusFieldId].filter(Boolean);
+  if (peopleFieldId) fids.push(peopleFieldId);
+  if (orgFieldId) fids.push(orgFieldId);
+  const query = fids.map(fid => `fieldIds[]=${encodeURIComponent(String(fid))}`).join('&');
+  let nextUrl = `/lists/${LIST_ID}/list-entries?${query}`;
   while (nextUrl) {
     const { data } = await V2.get(nextUrl);
     const batch = data?.data || [];
@@ -206,10 +274,12 @@ async function fetchEntriesWithStatus(statusFieldId) {
       const f = (e.fields || []).find(x => String(x.id) === String(statusFieldId));
       const label = f?.value?.data?.text ? String(f.value.data.text) : "";
       if (label) currentStatusById.set(e.id, label);
+      const assoc = extractAssociatedNamesFromFields(e.fields || [], peopleFieldId, orgFieldId);
+      associationsById.set(e.id, assoc);
     }
     nextUrl = data?.pagination?.nextUrl || null;
   }
-  return { entries, currentStatusById };
+  return { entries, currentStatusById, associationsById };
 }
 
 async function buildLabelMapFromEntries(statusFieldId) {
@@ -284,27 +354,8 @@ function accessedFromDetail(detailRaw) {
   return false;
 }
 
-async function fetchStatusFieldAndOptions() {
-  const { data } = await V2.get(`/lists/${LIST_ID}/fields`);
-  const fields = data?.data || [];
-  // Prefer explicit env var if provided
-  const desiredName = String(process.env.STATUS_FIELD_NAME || "Status").toLowerCase();
-  let statusField = fields.find(f => String(f?.name || "").toLowerCase() === desiredName);
-  if (!statusField) {
-    // Fallback: any dropdown-like field whose name contains 'status'
-    statusField = fields.find(f => /status/i.test(String(f?.name || "")));
-  }
-  if (!statusField) throw new Error("Could not find Status field on this list");
-
-  const options = statusField.dropdown_options || statusField.dropdownOptions || statusField.options || [];
-  let labelToId = new Map(options.map(o => [String(o?.name || o?.label || "").toLowerCase(), o?.id]));
-  // Fallback: learn map by scanning entries when options are not available via fields API
-  if (labelToId.size === 0) {
-    labelToId = await buildLabelMapFromEntries(statusField.id);
-  }
-  // Manual overrides (hard-coded mapping)
-  mergeManualOverrides(labelToId);
-  return { statusFieldId: statusField.id, labelToId, field: statusField };
+async function fetchStatusFieldAndOptionsWrapper() {
+  return await fetchStatusFieldAndOptions();
 }
 
 async function updateStatus(entryId, statusFieldId, optionId, valueType) {
@@ -530,10 +581,10 @@ export default async function handler(req, res) {
     if (!wantsRaw.length) return res.status(400).json({ ok: false, error: "CSV has neither Organization nor Person names" });
 
     // Discover Status field + options from Affinity
-    const { statusFieldId, labelToId, field: statusField } = await fetchStatusFieldAndOptions();
+    const { statusFieldId, labelToId, field: statusField, peopleFieldId, orgFieldId } = await fetchStatusFieldAndOptionsWrapper();
 
-    // Load Affinity entries and current status, then build type-specific indexes
-    const { entries, currentStatusById } = await fetchEntriesWithStatus(statusFieldId);
+    // Load Affinity entries and current status, then build type-specific indexes with associations
+    const { entries, currentStatusById, associationsById } = await fetchEntriesWithStatus(statusFieldId, peopleFieldId, orgFieldId);
     const orgKeyToEntry = new Map();
     const personKeyToEntry = new Map();
     const orgKeys = new Set();
@@ -567,36 +618,124 @@ export default async function handler(req, res) {
 
     const results = [];
     for (const rec of wantsRaw) {
-      // Try org match first (if any org candidates), then person; keep best by score
+      // Try org+person pair matching when both provided
       let best = { entry: null, type: "", score: 0, name: "" };
 
-      // Organizations
-      for (const name of rec.orgCandidates) {
-        const exactKey = normalizeOrgKey(name);
-        const direct = orgKeyToEntry.get(exactKey);
-        if (direct && 1.0 > best.score) best = { entry: direct, type: "organization", score: 1.0, name };
-        if (!direct) {
-          const m = safeBestMatchWithRating(exactKey, Array.from(orgKeys));
-          if (m && m.rating > best.score && m.rating >= 0.88) {
-            best = { entry: orgKeyToEntry.get(m.target), type: "organization", score: m.rating, name };
+      const personVariantSets = rec.personCandidates.map(n => ({ raw: n, variants: personKeyVariants(n) }));
+      const normalizedOrgCandidates = rec.orgCandidates.map(normalizeOrgKey);
+
+      // Pair path A: Start from org, validate associated people
+      for (let i = 0; i < normalizedOrgCandidates.length; i++) {
+        const orgKey = normalizedOrgCandidates[i];
+        const orgEntry = orgKeyToEntry.get(orgKey);
+        if (orgEntry) {
+          const assoc = associationsById.get(orgEntry.id) || { assocPeople: [], assocOrgs: [] };
+          // exact person variant hit boosts to 1.0
+          for (const pv of personVariantSets) {
+            const assocPeopleNorm = assoc.assocPeople.map(normalizePersonKey);
+            const exact = pv.variants.find(v => assocPeopleNorm.includes(v));
+            if (exact && 1.0 > best.score) { best = { entry: orgEntry, type: "organization", score: 1.0, name: rec.orgCandidates[i] }; }
+            if (!exact && assocPeopleNorm.length) {
+              const m = safeBestMatchWithRating(normalizePersonKey(pv.raw), assocPeopleNorm);
+              if (m && m.rating > best.score && m.rating >= 0.9) {
+                best = { entry: orgEntry, type: "organization", score: m.rating, name: rec.orgCandidates[i] };
+              }
+            }
+          }
+        } else {
+          // fuzzy org then validate person
+          const mOrg = safeBestMatchWithRating(orgKey, Array.from(orgKeys));
+          if (mOrg && mOrg.rating >= 0.9) {
+            const e = orgKeyToEntry.get(mOrg.target);
+            const assoc = associationsById.get(e.id) || { assocPeople: [], assocOrgs: [] };
+            for (const pv of personVariantSets) {
+              const assocPeopleNorm = assoc.assocPeople.map(normalizePersonKey);
+              const exact = pv.variants.find(v => assocPeopleNorm.includes(v));
+              if (exact && mOrg.rating > best.score) { best = { entry: e, type: "organization", score: mOrg.rating, name: rec.orgCandidates[i] }; }
+              if (!exact && assocPeopleNorm.length) {
+                const m = safeBestMatchWithRating(normalizePersonKey(pv.raw), assocPeopleNorm);
+                if (m && Math.min(m.rating, mOrg.rating) > best.score && m.rating >= 0.9) {
+                  best = { entry: e, type: "organization", score: Math.min(m.rating, mOrg.rating), name: rec.orgCandidates[i] };
+                }
+              }
+            }
           }
         }
       }
 
-      // People
-      for (const name of rec.personCandidates) {
-        const variants = personKeyVariants(name);
-        let matched = false;
-        for (const v of variants) {
-          const direct = personKeyToEntry.get(v);
-          if (direct && 1.0 > best.score) { best = { entry: direct, type: "person", score: 1.0, name }; matched = true; break; }
+      // Pair path B: Start from person, validate associated org
+      for (const pv of personVariantSets) {
+        let foundDirect = false;
+        for (const v of pv.variants) {
+          const pEntry = personKeyToEntry.get(v);
+          if (pEntry) {
+            foundDirect = true;
+            const assoc = associationsById.get(pEntry.id) || { assocPeople: [], assocOrgs: [] };
+            const assocOrgsNorm = assoc.assocOrgs.map(normalizeOrgKey);
+            for (let i = 0; i < normalizedOrgCandidates.length; i++) {
+              const ok = normalizedOrgCandidates[i];
+              if (assocOrgsNorm.includes(ok) && 1.0 > best.score) {
+                best = { entry: pEntry, type: "person", score: 1.0, name: pv.raw };
+              } else if (assocOrgsNorm.length) {
+                const m = safeBestMatchWithRating(ok, assocOrgsNorm);
+                if (m && m.rating > best.score && m.rating >= 0.9) {
+                  best = { entry: pEntry, type: "person", score: m.rating, name: pv.raw };
+                }
+              }
+            }
+          }
         }
-        if (!matched) {
-          // fuzzy on the base normalized person key
-          const base = normalizePersonKey(name);
-          const m = safeBestMatchWithRating(base, Array.from(personKeys));
-          if (m && m.rating > best.score && m.rating >= 0.85) {
-            best = { entry: personKeyToEntry.get(m.target), type: "person", score: m.rating, name };
+        if (!foundDirect) {
+          const base = normalizePersonKey(pv.raw);
+          const mP = safeBestMatchWithRating(base, Array.from(personKeys));
+          if (mP && mP.rating >= 0.9) {
+            const e = personKeyToEntry.get(mP.target);
+            const assoc = associationsById.get(e.id) || { assocPeople: [], assocOrgs: [] };
+            const assocOrgsNorm = assoc.assocOrgs.map(normalizeOrgKey);
+            for (let i = 0; i < normalizedOrgCandidates.length; i++) {
+              const ok = normalizedOrgCandidates[i];
+              if (assocOrgsNorm.includes(ok) && mP.rating > best.score) {
+                best = { entry: e, type: "person", score: mP.rating, name: pv.raw };
+              } else if (assocOrgsNorm.length) {
+                const m = safeBestMatchWithRating(ok, assocOrgsNorm);
+                const score = Math.min(m?.rating || 0, mP.rating);
+                if (m && score > best.score && m.rating >= 0.9) {
+                  best = { entry: e, type: "person", score, name: pv.raw };
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // If no pair found, fall back to type-only matching
+      if (!best.entry) {
+        // Organizations
+        for (const name of rec.orgCandidates) {
+          const exactKey = normalizeOrgKey(name);
+          const direct = orgKeyToEntry.get(exactKey);
+          if (direct && 1.0 > best.score) best = { entry: direct, type: "organization", score: 1.0, name };
+          if (!direct) {
+            const m = safeBestMatchWithRating(exactKey, Array.from(orgKeys));
+            if (m && m.rating > best.score && m.rating >= 0.88) {
+              best = { entry: orgKeyToEntry.get(m.target), type: "organization", score: m.rating, name };
+            }
+          }
+        }
+        // People
+        for (const name of rec.personCandidates) {
+          const variants = personKeyVariants(name);
+          let matched = false;
+          for (const v of variants) {
+            const direct = personKeyToEntry.get(v);
+            if (direct && 1.0 > best.score) { best = { entry: direct, type: "person", score: 1.0, name }; matched = true; break; }
+          }
+          if (!matched) {
+            const base = normalizePersonKey(name);
+            const m = safeBestMatchWithRating(base, Array.from(personKeys));
+            if (m && m.rating > best.score && m.rating >= 0.85) {
+              best = { entry: personKeyToEntry.get(m.target), type: "person", score: m.rating, name };
+            }
           }
         }
       }
