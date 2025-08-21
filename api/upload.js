@@ -133,6 +133,27 @@ function personKeyVariants(name) {
   return Array.from(variants);
 }
 
+// Heuristics to classify entity person vs organization, even when first/last are absent
+function isLikelyPersonName(name) {
+  const n = normalizeName(name);
+  const parts = n.split(' ').filter(Boolean);
+  if (parts.length < 2 || parts.length > 4) return false;
+  const orgKeywords = new Set(["inc","llc","ltd","limited","capital","partners","partner","holdings","group","ventures","foundation","family","company","co","plc","bv","gmbh","sarl","ag","llp","lp","org","foundation"]);
+  return !parts.some(p => orgKeywords.has(p));
+}
+function classifyEntityType(entity) {
+  const ent = entity || {};
+  const typeRaw = String(ent.type || ent.entity_type || "").toLowerCase();
+  if (/person|people|contact/.test(typeRaw)) return 'person';
+  if (/org|company|organization/.test(typeRaw)) return 'organization';
+  const first = ent.first_name ? String(ent.first_name) : "";
+  const last = ent.last_name ? String(ent.last_name) : "";
+  if (first || last) return 'person';
+  const name = String(ent.name || "");
+  if (isLikelyPersonName(name)) return 'person';
+  return 'organization';
+}
+
 function safeBestMatch(main, arr, minScore = 0.92) {
   try {
     const query = String(main ?? "");
@@ -288,6 +309,18 @@ async function fetchEntriesWithStatus(statusFieldId, peopleFieldIds, orgFieldIds
       const label = f?.value?.data?.text ? String(f.value.data.text) : "";
       if (label) currentStatusById.set(e.id, label);
       const assoc = extractAssociatedNamesFromFields(e.fields || [], peopleFieldIds, orgFieldIds);
+      // Include the entity itself as an association to aid pairing
+      const ent = e?.entity || {};
+      const entType = classifyEntityType(ent);
+      if (entType === 'person') {
+        const display = (ent.first_name || ent.last_name) ? `${ent.first_name || ''} ${ent.last_name || ''}`.trim() : String(ent.name || '').trim();
+        if (display) assoc.assocPeople.push(display);
+      } else {
+        const nm = String(ent.name || '').trim();
+        if (nm) assoc.assocOrgs.push(nm);
+      }
+      assoc.assocPeople = Array.from(new Set(assoc.assocPeople));
+      assoc.assocOrgs = Array.from(new Set(assoc.assocOrgs));
       associationsById.set(e.id, assoc);
     }
     nextUrl = data?.pagination?.nextUrl || null;
@@ -605,18 +638,17 @@ export default async function handler(req, res) {
 
     for (const e of entries) {
       const ent = e?.entity || {};
-      const first = ent.first_name ? String(ent.first_name) : "";
-      const last = ent.last_name ? String(ent.last_name) : "";
-      if (first || last) {
-        // person
-        const display = `${first} ${last}`.trim();
+      const entType = classifyEntityType(ent);
+      if (entType === 'person') {
+        const first = ent.first_name ? String(ent.first_name) : "";
+        const last = ent.last_name ? String(ent.last_name) : "";
+        const display = (first || last) ? `${first} ${last}`.trim() : String(ent.name || '').trim();
         const variants = personKeyVariants(display);
         for (const v of variants) {
           if (!personKeyToEntry.has(v)) personKeyToEntry.set(v, e);
           personKeys.add(v);
         }
       } else {
-        // organization
         const nm = ent.name ? String(ent.name) : "";
         if (nm) {
           const key = normalizeOrgKey(nm);
