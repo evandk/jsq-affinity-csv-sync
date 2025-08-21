@@ -214,17 +214,26 @@ function extractNamesFromValueData(val) {
   return Array.from(new Set(out));
 }
 
-function extractAssociatedNamesFromFields(fields, peopleFieldId, orgFieldId) {
+function extractAssociatedNamesFromFields(fields, peopleFieldIds, orgFieldIds) {
   const assocPeople = [];
   const assocOrgs = [];
+  const peopleSet = new Set((peopleFieldIds || []).map(String));
+  const orgSet = new Set((orgFieldIds || []).map(String));
+
+  // If we have explicit ids, only use them; else scan all fields heuristically
+  const scanAll = peopleSet.size === 0 && orgSet.size === 0;
+
   for (const f of fields || []) {
-    if (peopleFieldId && String(f.id) === String(peopleFieldId)) {
-      const names = extractNamesFromValueData(f?.value?.data);
-      assocPeople.push(...names);
+    const id = String(f.id);
+    const val = f?.value?.data;
+    if (!val) continue;
+    if (scanAll || orgSet.has(id)) {
+      const maybe = extractNamesFromValueData(val);
+      if (maybe.length) assocOrgs.push(...maybe);
     }
-    if (orgFieldId && String(f.id) === String(orgFieldId)) {
-      const names = extractNamesFromValueData(f?.value?.data);
-      assocOrgs.push(...names);
+    if (scanAll || peopleSet.has(id)) {
+      const maybe = extractNamesFromValueData(val);
+      if (maybe.length) assocPeople.push(...maybe);
     }
   }
   return { assocPeople: Array.from(new Set(assocPeople)), assocOrgs: Array.from(new Set(assocOrgs)) };
@@ -242,9 +251,13 @@ async function fetchStatusFieldAndOptions() {
   }
   if (!statusField) throw new Error("Could not find Status field on this list");
 
-  // Detect People and Organization fields
-  const peopleField = fields.find(f => /^people$/i.test(String(f?.name || "")) || /\bpeople\b/i.test(String(f?.name || "")));
-  const orgField = fields.find(f => /^organization$/i.test(String(f?.name || "")) || /organiza/i.test(String(f?.name || "")));
+  // Detect People and Organization fields (broader patterns)
+  const peopleFieldIds = fields
+    .filter(f => /(people|contacts?|contact)/i.test(String(f?.name || "")))
+    .map(f => f.id);
+  const orgFieldIds = fields
+    .filter(f => /(organization|organizations|company|firm|employer|org)/i.test(String(f?.name || "")))
+    .map(f => f.id);
 
   const options = statusField.dropdown_options || statusField.dropdownOptions || statusField.options || [];
   let labelToId = new Map(options.map(o => [String(o?.name || o?.label || "").toLowerCase(), o?.id]));
@@ -254,16 +267,16 @@ async function fetchStatusFieldAndOptions() {
   }
   // Manual overrides (hard-coded mapping)
   mergeManualOverrides(labelToId);
-  return { statusFieldId: statusField.id, labelToId, field: statusField, peopleFieldId: peopleField?.id, orgFieldId: orgField?.id };
+  return { statusFieldId: statusField.id, labelToId, field: statusField, peopleFieldIds, orgFieldIds };
 }
 
-async function fetchEntriesWithStatus(statusFieldId, peopleFieldId, orgFieldId) {
+async function fetchEntriesWithStatus(statusFieldId, peopleFieldIds, orgFieldIds) {
   const entries = [];
   const currentStatusById = new Map();
   const associationsById = new Map();
   const fids = [statusFieldId].filter(Boolean);
-  if (peopleFieldId) fids.push(peopleFieldId);
-  if (orgFieldId) fids.push(orgFieldId);
+  for (const fid of (peopleFieldIds || [])) fids.push(fid);
+  for (const fid of (orgFieldIds || [])) fids.push(fid);
   const query = fids.map(fid => `fieldIds[]=${encodeURIComponent(String(fid))}`).join('&');
   let nextUrl = `/lists/${LIST_ID}/list-entries?${query}`;
   while (nextUrl) {
@@ -274,7 +287,7 @@ async function fetchEntriesWithStatus(statusFieldId, peopleFieldId, orgFieldId) 
       const f = (e.fields || []).find(x => String(x.id) === String(statusFieldId));
       const label = f?.value?.data?.text ? String(f.value.data.text) : "";
       if (label) currentStatusById.set(e.id, label);
-      const assoc = extractAssociatedNamesFromFields(e.fields || [], peopleFieldId, orgFieldId);
+      const assoc = extractAssociatedNamesFromFields(e.fields || [], peopleFieldIds, orgFieldIds);
       associationsById.set(e.id, assoc);
     }
     nextUrl = data?.pagination?.nextUrl || null;
@@ -581,10 +594,10 @@ export default async function handler(req, res) {
     if (!wantsRaw.length) return res.status(400).json({ ok: false, error: "CSV has neither Organization nor Person names" });
 
     // Discover Status field + options from Affinity
-    const { statusFieldId, labelToId, field: statusField, peopleFieldId, orgFieldId } = await fetchStatusFieldAndOptionsWrapper();
+    const { statusFieldId, labelToId, field: statusField, peopleFieldIds, orgFieldIds } = await fetchStatusFieldAndOptions();
 
     // Load Affinity entries and current status, then build type-specific indexes with associations
-    const { entries, currentStatusById, associationsById } = await fetchEntriesWithStatus(statusFieldId, peopleFieldId, orgFieldId);
+    const { entries, currentStatusById, associationsById } = await fetchEntriesWithStatus(statusFieldId, peopleFieldIds, orgFieldIds);
     const orgKeyToEntry = new Map();
     const personKeyToEntry = new Map();
     const orgKeys = new Set();
