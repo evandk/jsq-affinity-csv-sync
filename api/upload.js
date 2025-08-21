@@ -33,14 +33,105 @@ const MIN_STATUS_LABEL = process.env.MIN_STATUS_LABEL || "Invited to Data Room";
 const MAX_CSV_BYTES = Number(process.env.MAX_CSV_BYTES || 2_000_000); // ~2MB default
 const REQUIRE_API_KEY = process.env.CSV_SYNC_API_KEY ? true : false;
 const REDACT_RESPONSE = process.env.REDACT_RESPONSE === '1';
+const PREFER_ORGANIZATIONS = process.env.PREFER_ORGANIZATIONS === '1';
+
+function normalizeAscii(s) {
+  return String(s || "").normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
 
 function normalizeName(name) {
-  const raw = String(name || "").normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const raw = normalizeAscii(name);
   return raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim()
     .replace(/\s+/g, " ");
+}
+
+function stripLegalSuffixes(orgName) {
+  const n = normalizeName(orgName);
+  // remove common corporate suffixes at end
+  return n
+    .replace(/\b(incorporated|inc|llc|l\.l\.c\.|ltd|limited|llp|l\.l\.p\.|lp|l\.p\.|plc|gmbh|sarl|s\.a\.|s\.a|ag|bv|b\.v\.)\b\.?$/g, "")
+    .replace(/\b(co|co\.|company|partners|partners?\b|holdings|capital)\b$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeOrgKey(orgName) {
+  return stripLegalSuffixes(orgName);
+}
+
+function normalizePersonKey(name) {
+  const n = normalizeName(name).replace(/\b(jr|sr|ii|iii|iv)\b/g, "").replace(/\s+/g, " ").trim();
+  // Prefer "first last"
+  return n;
+}
+
+function firstLastFromPersonName(name) {
+  const n = normalizePersonKey(name);
+  const parts = n.split(' ').filter(Boolean);
+  if (parts.length === 0) return { first: "", last: "" };
+  if (parts.length === 1) return { first: parts[0], last: "" };
+  return { first: parts[0], last: parts[parts.length - 1] };
+}
+
+function loadNicknameAliases() {
+  const defaults = {
+    "alexander": ["alex"],
+    "andrew": ["andy"],
+    "anthony": ["tony"],
+    "benjamin": ["ben"],
+    "charles": ["charlie", "chuck"],
+    "christopher": ["chris"],
+    "daniel": ["dan", "danny"],
+    "david": ["dave"],
+    "elizabeth": ["liz", "beth", "lizzy", "eliza"],
+    "jacob": ["jake"],
+    "james": ["jim", "jimmy"],
+    "jonathan": ["jon"],
+    "joshua": ["josh"],
+    "katherine": ["kate", "katie", "kat"],
+    "matthew": ["matt"],
+    "michael": ["mike"],
+    "nicholas": ["nick"],
+    "patrick": ["pat"],
+    "robert": ["rob", "bob", "bobby"],
+    "steven": ["steve"],
+    "thomas": ["tom"],
+    "william": ["will", "bill", "billy"]
+  };
+  try {
+    const raw = process.env.NICKNAME_ALIASES_JSON;
+    if (!raw) return defaults;
+    const custom = JSON.parse(raw);
+    Object.entries(custom).forEach(([k, v]) => {
+      const key = String(k).toLowerCase();
+      const arr = Array.isArray(v) ? v.map(x => String(x).toLowerCase()) : [String(v).toLowerCase()];
+      defaults[key] = Array.from(new Set([...(defaults[key] || []), ...arr]));
+    });
+    return defaults;
+  } catch { return defaults; }
+}
+
+const NICKNAMES = loadNicknameAliases();
+
+function personKeyVariants(name) {
+  const { first, last } = firstLastFromPersonName(name);
+  const variants = new Set();
+  if (!first && !last) return [];
+  const firsts = new Set([first]);
+  const nick = NICKNAMES[first];
+  if (nick && nick.length) nick.forEach(n => firsts.add(n));
+  // Also if first looks like nickname, add possible canonical forms
+  Object.entries(NICKNAMES).forEach(([canon, arr]) => {
+    if (arr.includes(first)) firsts.add(canon);
+  });
+  for (const f of firsts) {
+    const key = normalizeName(`${f} ${last}`);
+    variants.add(key);
+  }
+  return Array.from(variants);
 }
 
 function safeBestMatch(main, arr, minScore = 0.92) {
@@ -54,6 +145,16 @@ function safeBestMatch(main, arr, minScore = 0.92) {
   } catch {
     return null;
   }
+}
+
+function safeBestMatchWithRating(main, arr) {
+  try {
+    const query = String(main ?? "");
+    const candidates = Array.isArray(arr) ? arr.map(x => String(x ?? "")).filter(s => s.length > 0) : [];
+    if (!query || candidates.length === 0) return null;
+    const { bestMatch } = stringSimilarity.findBestMatch(query, candidates);
+    return bestMatch || null;
+  } catch { return null; }
 }
 
 function isAuthorized(req) {
@@ -242,6 +343,33 @@ async function readCsvBody(req, limitBytes) {
   });
 }
 
+function extractOrgCandidates(row) {
+  const candidates = [];
+  const tryKeys = ["Organization", "Firm", "Company"]; // prioritized org-like columns
+  for (const k of tryKeys) {
+    const v = row[k];
+    if (v && String(v).trim()) candidates.push(String(v).trim());
+  }
+  return Array.from(new Set(candidates));
+}
+
+function extractPersonCandidates(row) {
+  const candidates = [];
+  const tryKeys = ["Name", "Investor Name", "LP Name", "Contacts", "Contact"]; // person-like columns
+  for (const k of tryKeys) {
+    const v = row[k];
+    if (!v) continue;
+    const s = String(v);
+    if (k.toLowerCase().includes('contact') || s.includes('∙') || s.includes(';')) {
+      s.split(/\s*[;|∙]\s*/).forEach(part => { if (part && part.trim()) candidates.push(part.trim()); });
+    } else {
+      candidates.push(s.trim());
+    }
+  }
+  // de-dup
+  return Array.from(new Set(candidates));
+}
+
 function deriveStatusLabelFromRow(row) {
   const get = (k) => String(row[k] ?? row[String(k).replace(/^\s+|\s+$/g, "")] ?? "").trim();
   const lower = (s) => String(s || "").toLowerCase();
@@ -393,22 +521,45 @@ export default async function handler(req, res) {
       skip_empty_lines: true
     });
 
-    // Expect a name column; status may be direct or derived
+    // Expect candidates separated into org vs person for type-safe matching
     const wantsRaw = records.map(r => ({
-      name: String(r.Name || r["Investor Name"] || r["LP Name"] || r["Organization"] || r["Contacts"] || r["Contact"] || "").split(';')[0].trim(),
+      orgCandidates: extractOrgCandidates(r),
+      personCandidates: extractPersonCandidates(r),
       raw: r
-    })).filter(r => r.name);
-    if (!wantsRaw.length) return res.status(400).json({ ok: false, error: "CSV has no Name column" });
+    })).filter(r => r.orgCandidates.length || r.personCandidates.length);
+    if (!wantsRaw.length) return res.status(400).json({ ok: false, error: "CSV has neither Organization nor Person names" });
 
     // Discover Status field + options from Affinity
     const { statusFieldId, labelToId, field: statusField } = await fetchStatusFieldAndOptions();
 
-    // Load Affinity entries and current status
+    // Load Affinity entries and current status, then build type-specific indexes
     const { entries, currentStatusById } = await fetchEntriesWithStatus(statusFieldId);
-    const nameToEntry = new Map();
+    const orgKeyToEntry = new Map();
+    const personKeyToEntry = new Map();
+    const orgKeys = new Set();
+    const personKeys = new Set();
+
     for (const e of entries) {
-      const nm = normalizeName(e?.entity?.name || (e?.entity?.first_name && `${e.entity.first_name} ${e.entity.last_name}`) || "");
-      if (nm) nameToEntry.set(nm, e);
+      const ent = e?.entity || {};
+      const first = ent.first_name ? String(ent.first_name) : "";
+      const last = ent.last_name ? String(ent.last_name) : "";
+      if (first || last) {
+        // person
+        const display = `${first} ${last}`.trim();
+        const variants = personKeyVariants(display);
+        for (const v of variants) {
+          if (!personKeyToEntry.has(v)) personKeyToEntry.set(v, e);
+          personKeys.add(v);
+        }
+      } else {
+        // organization
+        const nm = ent.name ? String(ent.name) : "";
+        if (nm) {
+          const key = normalizeOrgKey(nm);
+          if (!orgKeyToEntry.has(key)) orgKeyToEntry.set(key, e);
+          orgKeys.add(key);
+        }
+      }
     }
 
     const knownOptions = Array.from(new Set(Array.from(labelToId.keys())));
@@ -416,19 +567,46 @@ export default async function handler(req, res) {
 
     const results = [];
     for (const rec of wantsRaw) {
-      const targetNorm = normalizeName(rec.name);
-      let entry = nameToEntry.get(targetNorm);
+      // Try org match first (if any org candidates), then person; keep best by score
+      let best = { entry: null, type: "", score: 0, name: "" };
 
-      // Fallback fuzzy (safe)
-      if (!entry) {
-        const candidates = Array.from(nameToEntry.keys());
-        const target = safeBestMatch(targetNorm, candidates, 0.88);
-        if (target) entry = nameToEntry.get(target);
+      // Organizations
+      for (const name of rec.orgCandidates) {
+        const exactKey = normalizeOrgKey(name);
+        const direct = orgKeyToEntry.get(exactKey);
+        if (direct && 1.0 > best.score) best = { entry: direct, type: "organization", score: 1.0, name };
+        if (!direct) {
+          const m = safeBestMatchWithRating(exactKey, Array.from(orgKeys));
+          if (m && m.rating > best.score && m.rating >= 0.88) {
+            best = { entry: orgKeyToEntry.get(m.target), type: "organization", score: m.rating, name };
+          }
+        }
       }
 
+      // People
+      for (const name of rec.personCandidates) {
+        const variants = personKeyVariants(name);
+        let matched = false;
+        for (const v of variants) {
+          const direct = personKeyToEntry.get(v);
+          if (direct && 1.0 > best.score) { best = { entry: direct, type: "person", score: 1.0, name }; matched = true; break; }
+        }
+        if (!matched) {
+          // fuzzy on the base normalized person key
+          const base = normalizePersonKey(name);
+          const m = safeBestMatchWithRating(base, Array.from(personKeys));
+          if (m && m.rating > best.score && m.rating >= 0.85) {
+            best = { entry: personKeyToEntry.get(m.target), type: "person", score: m.rating, name };
+          }
+        }
+      }
+
+      const entry = best.entry;
       const statusLabel = deriveStatusLabelFromRow(rec.raw);
+      const displayName = rec.orgCandidates[0] || rec.personCandidates[0] || best.name || "";
+
       if (!entry) {
-        results.push({ name: rec.name, statusLabel, matched: false });
+        results.push({ name: displayName, statusLabel, matched: false, reason: "No suitable org/person match" });
         continue;
       }
 
@@ -436,7 +614,7 @@ export default async function handler(req, res) {
       let currentLabel = String(currentStatusById.get(entry.id) || "");
       if (!currentLabel) currentLabel = await fetchEntryStatusLabel(entry.id, statusFieldId);
       if (isPassedLabel(currentLabel)) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Currently '${currentLabel}'; no change` });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Currently '${currentLabel}'; no change`, matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
 
@@ -445,38 +623,38 @@ export default async function handler(req, res) {
       const derivedIdx = STATUS_INDEX.get(String(statusLabel || '').toLowerCase());
 
       if ((minIdx !== -1 && (derivedIdx ?? -1) < minIdx)) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Status before minimum threshold (${MIN_STATUS_LABEL})` });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Status before minimum threshold (${MIN_STATUS_LABEL})`, matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
       if ((currentIdx ?? -1) !== -1 && (derivedIdx ?? -1) !== -1 && derivedIdx < currentIdx) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Would downgrade from '${currentLabel}' to '${statusLabel}'` });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Would downgrade from '${currentLabel}' to '${statusLabel}'`, matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
       if (currentLabel && currentLabel.toLowerCase() === String(statusLabel || '').toLowerCase()) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: 'Unchanged' });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, reason: 'Unchanged', matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
 
       const optionId = resolveStatusOptionId(statusLabel, labelToId);
       if (!statusLabel) {
-        results.push({ name: rec.name, matched: true, entryId: entry.id, updated: false, reason: "Could not derive status from CSV row" });
+        results.push({ name: displayName, matched: true, entryId: entry.id, updated: false, reason: "Could not derive status from CSV row", matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
       if (!optionId) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for field '${statusField.name}'`, knownOptions });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, reason: `Unknown status '${statusLabel}' for field '${statusField.name}'`, knownOptions, matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
 
       if (isDryRun) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, wouldUpdate: true });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, wouldUpdate: true, matchType: best.type, score: Number(best.score.toFixed(3)) });
         continue;
       }
 
       try {
         await updateStatus(entry.id, statusFieldId, optionId, statusField.valueType || statusField.value_type);
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: true });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: true, matchType: best.type, score: Number(best.score.toFixed(3)) });
       } catch (e) {
-        results.push({ name: rec.name, statusLabel, matched: true, entryId: entry.id, updated: false, error: e?.response?.data || e.message });
+        results.push({ name: displayName, statusLabel, matched: true, entryId: entry.id, updated: false, error: e?.response?.data || e.message, matchType: best.type, score: Number(best.score.toFixed(3)) });
       }
     }
 
